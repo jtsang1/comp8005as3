@@ -35,7 +35,7 @@ Definitions
 #define TRUE 				1
 #define FALSE 				0
 #define EPOLL_QUEUE_LEN			256
-#define BUFLEN				800
+#define BUFLEN				1024
 
 
 /* cinfo for storing client socket info*/
@@ -285,7 +285,7 @@ int main (int argc, char* argv[]) {
 
 /* Read Buffer */
 static int ClearSocket (int fd) {
-	int n, bytes_to_read, m = 0;
+	int n = 0, bytes_to_read, m = 0, l = 0;
 	char *bp, buf[BUFLEN];
 		
 	bp = buf;
@@ -294,14 +294,17 @@ static int ClearSocket (int fd) {
 	// Edge-triggered event will only notify once, so we must
 	// read everything in the buffer
 	while(1){
+		
 		n = recv (fd, bp, bytes_to_read, 0);
 	
 		// Read message
 		if(n > 0){
 			m++;
-			
-			printf ("Read (%d) bytes on fd %d:\n%s\n", n, fd, buf);
-			
+			bp+=n;
+			bytes_to_read-=n;
+			l+=n;
+			//printf ("Read (%d) bytes on fd %d:\n%s\n", n, fd, buf);
+			//fwrite(buf, 1, n, stdout);
 			/*int l = send(fd, buf, BUFLEN, 0);
 			if(l == -1){
 				
@@ -314,8 +317,7 @@ static int ClearSocket (int fd) {
 			
 			break;
 		}
-		// Wrong message size or zero-length message
-		// Stream socket peer has performed an orderly shutdown
+		// Zero-length message ,stream socket peer has performed an orderly shutdown
 		else{
 			printf ("Shutdown on fd %d\n", fd);
 			break;
@@ -326,8 +328,20 @@ static int ClearSocket (int fd) {
 	
 	if(m == 0)
 		return FALSE;
-	else
+	else{
+		printf ("Read (%d) bytes on fd %d:\n", l, fd);
+		fwrite(buf, 1, l, stdout);
+		/*int k = send(fd, buf, BUFLEN, 0);
+		if(l == -1){
+		
+		}
+		else if(k != l){
+		
+		}*/
+		
 		return TRUE;
+	}
+		
 	/*
 	while ((n = recv (fd, bp, bytes_to_read, 0)) > 0)
 	{
