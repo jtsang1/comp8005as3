@@ -64,16 +64,15 @@ int servers_size = 0;
 
 /* Function prototypes */
 static void SystemFatal (const char* message);
-static int ClearSocket (int fd);
+static int ClearSocket (cinfo * c_ptr);
 void close_server (int);
 sinfo * is_server(int fd);
 
 
 
 /*******************************************************************************
-Functions
+Main
 *******************************************************************************/
-/* Main */
 int main (int argc, char* argv[]) {
 
 	int i, arg; 
@@ -117,7 +116,8 @@ int main (int argc, char* argv[]) {
 		
 		// Info from each line
 		int port = atoi(config[0]);
-		char * server = config[1];
+		char * server = malloc(sizeof(config[1]));
+		strcpy(server,config[1]);
 		int server_port = atoi(config[2]);
 		
 		// Create the listening socket
@@ -143,7 +143,7 @@ int main (int argc, char* argv[]) {
 		addr.sin_addr.s_addr = htonl(INADDR_ANY);
 		addr.sin_port = htons(port);
 		
-		printf("Listening on port %d...\n",port);
+		printf("Listening on port %d (forwards to %s:%d) using fd (%d)...\n",port,server,server_port,fd_server);
 		
 		if (bind (fd_server, (struct sockaddr*) &addr, sizeof(addr)) == -1) 
 			SystemFatal("bind");
@@ -158,8 +158,8 @@ int main (int argc, char* argv[]) {
 		server_sinfo->server = server;
 		server_sinfo->server_port = server_port;
 		
-		servers = realloc(servers,sizeof(sinfo *) * servers_size);
-		servers[servers_size++] = server_sinfo;
+		servers = realloc(servers,sizeof(sinfo *) * ++servers_size);
+		servers[servers_size-1] = server_sinfo;
 	
 		// Add the server socket to the epoll event loop with it's data
 		event.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
@@ -228,40 +228,86 @@ int main (int argc, char* argv[]) {
 				if ((s_ptr = is_server(c_ptr->fd)) != NULL){
 				
 					printf("EPOLLIN - incoming connection fd:%d\n",s_ptr->fd);
+					printf("server:%s server_port:%d\n",s_ptr->server, s_ptr->server_port);
 					
 					while(1){
-								
+						
+						// Accept connection
 						struct sockaddr_in in_addr;
 						socklen_t in_len;
 						int fd_new = 0;
-						
 						//memset (&in_addr, 1, sizeof (struct sockaddr_in));
 						fd_new = accept(s_ptr->fd, (struct sockaddr *)&in_addr, &in_len);
 						if (fd_new == -1){
 							// If error in accept call
 							if (errno != EAGAIN && errno != EWOULDBLOCK)
-								SystemFatal("accept");//perror("accept");
+								perror("accept");
 								
-							perror("wat");
 							// All connections have been processed
 							break;
 						}
 						
 						printf("EPOLLIN - connected fd: %d\n", fd_new);
 						
-						// Make the fd_new non-blocking
+						// Make fd_new non blocking
 						if (fcntl (fd_new, F_SETFL, O_NONBLOCK | fcntl(fd_new, F_GETFL, 0)) == -1) 
 							SystemFatal("fcntl");
-				
+						
+						// Create corresponding socket to forward to
+						int fd_pair;
+						if((fd_pair = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+							SystemFatal("socket");
+						
+						// Add fd_new to epoll
 						event.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
 						
 						cinfo * client_info = malloc(sizeof(cinfo));
 						client_info->fd = fd_new;
+						client_info->fd_pair = fd_pair;
 						event.data.ptr = (void *)client_info;
 						
 						if (epoll_ctl (epoll_fd, EPOLL_CTL_ADD, fd_new, &event) == -1) 
 							SystemFatal ("epoll_ctl");
-
+						
+						// Initialize fd_pair sockaddr_in
+						struct sockaddr_in server;
+						struct hostent * hp;
+						memset(&server, 0, sizeof(struct sockaddr_in));
+						server.sin_family = AF_INET;
+						server.sin_port = htons(s_ptr->server_port);
+						printf("gethostbyname (%s)\n",s_ptr->server);
+						if((hp = gethostbyname(s_ptr->server)) == NULL)
+							SystemFatal("gethostbyname");
+						bcopy(hp->h_addr, (char *)&server.sin_addr, hp->h_length);
+						
+						// Set SO_REUSEADDR so port can be reused immediately
+						int arg = 1;
+						if(setsockopt(fd_pair, SOL_SOCKET, SO_REUSEADDR, &arg, sizeof(arg)) == -1)
+							SystemFatal("setsockopt");
+		
+						// Make server socket non-blocking
+						if(fcntl(fd_pair, F_SETFL, O_NONBLOCK | fcntl(fd_pair, F_GETFL, 0)) == -1)
+							SystemFatal("fcntl");
+						
+						// Connect fd_pair
+						if(connect(fd_pair, (struct sockaddr *)&server, sizeof(server)) == -1){
+							if(errno == EINPROGRESS) // Only connecting on non-blocking socket
+								perror("connect");
+							else
+								SystemFatal("connect");
+						}
+						
+						// Add fd_pair to epoll
+						event.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+						
+						cinfo * client_info2 = malloc(sizeof(cinfo));
+						client_info2->fd = fd_pair;
+						client_info2->fd_pair = fd_new;
+						event.data.ptr = (void *)client_info2;
+		
+						if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd_pair, &event) == -1)
+							SystemFatal("epoll_ctl");
+						
 						continue;
 					}
 				}
@@ -269,10 +315,13 @@ int main (int argc, char* argv[]) {
 				else{
 					fprintf(stdout,"EPOLLIN - read fd: %d\n", c_ptr->fd);
 					
-					if (!ClearSocket(c_ptr->fd)){
+					if (!ClearSocket(c_ptr)){
 						// epoll will remove the fd from its set
 						// automatically when the fd is closed
 						close(c_ptr->fd);
+						
+						// Close forwarding socket
+						close(c_ptr->fd_pair);
 					}
 				}
 			}
@@ -283,11 +332,16 @@ int main (int argc, char* argv[]) {
 }
 
 
-/* Read Buffer */
-static int ClearSocket (int fd) {
+
+/*******************************************************************************
+Read Buffer
+*******************************************************************************/
+static int ClearSocket (cinfo * c_ptr) {
 	int n = 0, bytes_to_read, m = 0, l = 0;
 	char *bp, buf[BUFLEN];
-		
+	int fd = c_ptr->fd;
+	int fd_pair = c_ptr->fd_pair;
+	
 	bp = buf;
 	bytes_to_read = BUFLEN;
 	
@@ -300,15 +354,29 @@ static int ClearSocket (int fd) {
 		// Read message
 		if(n > 0){
 			m++;
-			bp+=n;
-			bytes_to_read-=n;
 			l+=n;
-			//printf ("Read (%d) bytes on fd %d:\n%s\n", n, fd, buf);
-			//fwrite(buf, 1, n, stdout);
-			/*int l = send(fd, buf, BUFLEN, 0);
-			if(l == -1){
-				
-			}*/
+			
+			printf ("Read (%d) bytes on fd %d:\n", n, fd);
+			fwrite(buf, 1, n, stdout);
+			
+			int k = 0;
+			int bytes_to_send = n;
+			while(1){
+				k = send(fd_pair, buf, bytes_to_send, 0);
+				printf ("Send (%d) bytes on fd %d:\n", k, fd_pair);
+				if(k == -1){
+					if(errno == EAGAIN || errno == EWOULDBLOCK)
+						continue;
+					else{
+						perror("send");
+						break;
+					}
+				}
+				else if(k == bytes_to_send){
+					// Finished sending
+				}
+				else if(k == 
+			}
 		}
 		// No more messages or read error
 		else if(n == -1){
@@ -324,14 +392,18 @@ static int ClearSocket (int fd) {
 		}
 	}
 	
-	//printf ("sending m:%d\n", m);
 	
-	if(m == 0)
+	if(m == 0){
+		// Close socket
 		return FALSE;
+	}
 	else{
+		/*// Copy and forward data
 		printf ("Read (%d) bytes on fd %d:\n", l, fd);
 		fwrite(buf, 1, l, stdout);
-		/*int k = send(fd, buf, BUFLEN, 0);
+		
+		int k = send(fd_pair, buf, l, 0);
+		
 		if(l == -1){
 		
 		}
@@ -341,35 +413,23 @@ static int ClearSocket (int fd) {
 		
 		return TRUE;
 	}
-		
-	/*
-	while ((n = recv (fd, bp, bytes_to_read, 0)) > 0)
-	{
-		bp += n;
-		bytes_to_read -= n;
-		m++;
-	}
-	
-	if(m == 0)
-		return FALSE;
-	
-	//printf ("sending:%s\tloops:%d\n", buf, m);
-	printf ("sending:%s\n", buf);
-
-	send (fd, buf, BUFLEN, 0);
-	//close (fd);
-	return TRUE;*/
 }
 
 
-/* Prints the error stored in errno and aborts the program. */
+
+/*******************************************************************************
+Prints the error stored in errno and aborts the program.
+*******************************************************************************/
 static void SystemFatal(const char* message) {
     perror (message);
     exit (EXIT_FAILURE);
 }
 
 
-/* Server closing function, signalled by CTRL-C. */
+
+/*******************************************************************************
+Server closing function, signalled by CTRL-C. 
+*******************************************************************************/
 void close_server (int signo){
     	int c = 0;
     	for(;c < servers_size;c++){
@@ -379,7 +439,10 @@ void close_server (int signo){
 }
 
 
-/* Check if fd is a server socket. */
+
+/*******************************************************************************
+Check if fd is a server socket.
+*******************************************************************************/
 sinfo * is_server(int fd){
 	int c = 0;
 	for(;c < servers_size;c++){
