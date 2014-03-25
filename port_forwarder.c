@@ -42,6 +42,7 @@ Definitions
 typedef struct{
 	int fd;		// Socket descriptor
 	int fd_pair;	// Corresponding socket to forward to
+	int active;	// Set to true when socket is confirmed to be connected
 }cinfo;
 
 
@@ -194,11 +195,12 @@ int main (int argc, char* argv[]) {
 	    			// Get socket cinfo
 	    			cinfo * c_ptr = (cinfo *)events[i].data.ptr;
     		
-				fprintf(stdout,"EPOLLHUP - closing fd: %d\n", c_ptr->fd);
+    				if(c_ptr->active == 1){
+					fprintf(stdout,"EPOLLHUP - closing fd: %d\n", c_ptr->fd);
 				
-				close(c_ptr->fd);
-				//free(c_ptr);
-				
+					close(c_ptr->fd);
+					//free(c_ptr);
+				}
 				continue;
 			}
 			
@@ -226,9 +228,6 @@ int main (int argc, char* argv[]) {
 				// Server is receiving one or more incoming connection requests
 				sinfo * s_ptr = NULL;
 				if ((s_ptr = is_server(c_ptr->fd)) != NULL){
-				
-					printf("EPOLLIN - incoming connection fd:%d\n",s_ptr->fd);
-					printf("server:%s server_port:%d\n",s_ptr->server, s_ptr->server_port);
 					
 					while(1){
 						
@@ -292,7 +291,7 @@ int main (int argc, char* argv[]) {
 						// Connect fd_pair
 						if(connect(fd_pair, (struct sockaddr *)&server, sizeof(server)) == -1){
 							if(errno == EINPROGRESS) // Only connecting on non-blocking socket
-								perror("connect");
+								;
 							else
 								SystemFatal("connect");
 						}
@@ -303,6 +302,7 @@ int main (int argc, char* argv[]) {
 						cinfo * client_info2 = malloc(sizeof(cinfo));
 						client_info2->fd = fd_pair;
 						client_info2->fd_pair = fd_new;
+						client_info2->active = 0;
 						event.data.ptr = (void *)client_info2;
 		
 						if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd_pair, &event) == -1)
@@ -334,22 +334,24 @@ int main (int argc, char* argv[]) {
 
 
 /*******************************************************************************
-Read Buffer
+Read buffer and forward data
 *******************************************************************************/
 static int ClearSocket (cinfo * c_ptr) {
 	int n = 0, bytes_to_read, m = 0, l = 0;
 	char *bp, buf[BUFLEN];
 	int fd = c_ptr->fd;
 	int fd_pair = c_ptr->fd_pair;
+
+	// Confirm socket is connected
+	c_ptr->active = 1;
 	
-	bp = buf;
 	bytes_to_read = BUFLEN;
 	
 	// Edge-triggered event will only notify once, so we must
 	// read everything in the buffer
 	while(1){
 		
-		n = recv (fd, bp, bytes_to_read, 0);
+		n = recv (fd, buf, bytes_to_read, 0);
 	
 		// Read message
 		if(n > 0){
@@ -357,16 +359,18 @@ static int ClearSocket (cinfo * c_ptr) {
 			l+=n;
 			
 			printf ("Read (%d) bytes on fd %d:\n", n, fd);
-			fwrite(buf, 1, n, stdout);
+			//fwrite(buf, 1, n, stdout);
 			
+			// Loop until everything is sent
 			int k = 0;
 			int bytes_to_send = n;
+			bp = buf;
 			while(1){
-				k = send(fd_pair, buf, bytes_to_send, 0);
-				printf ("Send (%d) bytes on fd %d:\n", k, fd_pair);
+				k = send(fd_pair, bp, bytes_to_send, 0);
+				printf ("Send (%d) bytes on fd %d\n", k, fd_pair);
 				if(k == -1){
 					if(errno == EAGAIN || errno == EWOULDBLOCK)
-						continue;
+						continue; // Send buffer full, keep looping
 					else{
 						perror("send");
 						break;
@@ -374,8 +378,14 @@ static int ClearSocket (cinfo * c_ptr) {
 				}
 				else if(k == bytes_to_send){
 					// Finished sending
+					break;
 				}
-				else if(k == 
+				else{
+					// Sent partial message, keep looping
+					bp += k;
+					bytes_to_send -= k;
+					continue;
+				}
 			}
 		}
 		// No more messages or read error
@@ -398,19 +408,6 @@ static int ClearSocket (cinfo * c_ptr) {
 		return FALSE;
 	}
 	else{
-		/*// Copy and forward data
-		printf ("Read (%d) bytes on fd %d:\n", l, fd);
-		fwrite(buf, 1, l, stdout);
-		
-		int k = send(fd_pair, buf, l, 0);
-		
-		if(l == -1){
-		
-		}
-		else if(k != l){
-		
-		}*/
-		
 		return TRUE;
 	}
 }
